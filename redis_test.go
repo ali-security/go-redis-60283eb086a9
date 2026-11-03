@@ -1,11 +1,16 @@
 package redis_test
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"strconv"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -47,6 +52,197 @@ func TestHookError(t *testing.T) {
 	wanted := "hook error"
 	if err.Error() != wanted {
 		t.Fatalf(`got %q, wanted %q`, err, wanted)
+	}
+}
+
+// slowSetInfoServer emulates a Redis server that does not answer
+// CLIENT SETINFO in time: the SETINFO replies are only sent together with
+// the reply to the next command, i.e. after the client gave up waiting.
+type slowSetInfoServer struct {
+	ln      net.Listener
+	setInfo int32 // number of CLIENT SETINFO commands received
+}
+
+func newSlowSetInfoServer(t *testing.T) *slowSetInfoServer {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := &slowSetInfoServer{ln: ln}
+	t.Cleanup(func() { _ = ln.Close() })
+	go srv.serve()
+	return srv
+}
+
+func (srv *slowSetInfoServer) addr() string {
+	return srv.ln.Addr().String()
+}
+
+func (srv *slowSetInfoServer) setInfoCount() int32 {
+	return atomic.LoadInt32(&srv.setInfo)
+}
+
+func (srv *slowSetInfoServer) serve() {
+	for {
+		cn, err := srv.ln.Accept()
+		if err != nil {
+			return
+		}
+		go srv.handle(cn)
+	}
+}
+
+func (srv *slowSetInfoServer) handle(cn net.Conn) {
+	defer cn.Close()
+
+	rd := bufio.NewReader(cn)
+	var pending []byte
+	for {
+		args, err := readRESPCommand(rd)
+		if err != nil {
+			return
+		}
+
+		var reply []byte
+		switch {
+		case strings.EqualFold(args[0], "HELLO"):
+			reply = []byte("-ERR unknown command 'HELLO'\r\n")
+		case strings.EqualFold(args[0], "CLIENT") && len(args) > 1 && strings.EqualFold(args[1], "SETINFO"):
+			atomic.AddInt32(&srv.setInfo, 1)
+			pending = append(pending, "+OK\r\n"...)
+			continue
+		case strings.EqualFold(args[0], "GET"):
+			reply = []byte("$5\r\nvalue\r\n")
+		default:
+			reply = []byte("-ERR unknown command\r\n")
+		}
+
+		if _, err := cn.Write(append(pending, reply...)); err != nil {
+			return
+		}
+		pending = nil
+	}
+}
+
+func readRESPCommand(rd *bufio.Reader) ([]string, error) {
+	line, err := rd.ReadString('\n')
+	if err != nil {
+		return nil, err
+	}
+	if !strings.HasPrefix(line, "*") {
+		return nil, fmt.Errorf("unexpected command line %q", line)
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(line[1:]))
+	if err != nil || n < 1 {
+		return nil, fmt.Errorf("invalid command length %q", line)
+	}
+
+	args := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		line, err := rd.ReadString('\n')
+		if err != nil {
+			return nil, err
+		}
+		if !strings.HasPrefix(line, "$") {
+			return nil, fmt.Errorf("unexpected argument line %q", line)
+		}
+		size, err := strconv.Atoi(strings.TrimSpace(line[1:]))
+		if err != nil || size < 0 {
+			return nil, fmt.Errorf("invalid argument length %q", line)
+		}
+		buf := make([]byte, size+2)
+		if _, err := io.ReadFull(rd, buf); err != nil {
+			return nil, err
+		}
+		args = append(args, string(buf[:size]))
+	}
+	return args, nil
+}
+
+// TestClientSetInfoTimeout checks that a network error (e.g. a timeout) of
+// CLIENT SETINFO during connection initialization is not ignored. Otherwise
+// the late SETINFO replies are read as the replies of the following commands
+// sent over the same connection, i.e. the responses get out of order.
+func TestClientSetInfoTimeout(t *testing.T) {
+	gets := []struct {
+		name string
+		get  func(client *redis.Client) (string, error)
+	}{
+		{"client", func(client *redis.Client) (string, error) {
+			return client.Get(ctx, "key").Result()
+		}},
+		{"pipeline", func(client *redis.Client) (string, error) {
+			var cmd *redis.StringCmd
+			if _, err := client.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+				cmd = pipe.Get(ctx, "key")
+				return nil
+			}); err != nil {
+				return "", err
+			}
+			return cmd.Result()
+		}},
+		{"conn", func(client *redis.Client) (string, error) {
+			conn := client.Conn()
+			defer conn.Close()
+			return conn.Get(ctx, "key").Result()
+		}},
+	}
+
+	for _, tt := range gets {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newSlowSetInfoServer(t)
+			client := redis.NewClient(&redis.Options{
+				Addr:        srv.addr(),
+				ReadTimeout: 100 * time.Millisecond,
+				MaxRetries:  -1,
+			})
+			defer client.Close()
+
+			val, err := tt.get(client)
+			if err == nil {
+				t.Fatalf("got %q, expected a timeout error instead of an out of order CLIENT SETINFO reply", val)
+			}
+			var netErr net.Error
+			if !errors.As(err, &netErr) || !netErr.Timeout() {
+				t.Fatalf("got %v, expected a timeout error", err)
+			}
+			if srv.setInfoCount() == 0 {
+				t.Fatalf("expected CLIENT SETINFO to be sent")
+			}
+		})
+	}
+
+	disabled := []struct {
+		name string
+		opt  *redis.Options
+	}{
+		{"DisableIdentity", &redis.Options{DisableIdentity: true}},
+		{"DisableIndentity", &redis.Options{DisableIndentity: true}},
+	}
+
+	for _, tt := range disabled {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newSlowSetInfoServer(t)
+			opt := tt.opt
+			opt.Addr = srv.addr()
+			opt.ReadTimeout = 100 * time.Millisecond
+			opt.MaxRetries = -1
+			client := redis.NewClient(opt)
+			defer client.Close()
+
+			val, err := client.Get(ctx, "key").Result()
+			if err != nil {
+				t.Fatalf("got %v, expected no error", err)
+			}
+			if val != "value" {
+				t.Fatalf("got %q, wanted %q", val, "value")
+			}
+			if n := srv.setInfoCount(); n != 0 {
+				t.Fatalf("got %d CLIENT SETINFO commands, expected none", n)
+			}
+		})
 	}
 }
 
@@ -373,6 +569,13 @@ var _ = Describe("Client timeout", func() {
 	})
 
 	testTimeout := func() {
+		It("SETINFO timeouts", func() {
+			conn := client.Conn()
+			err := conn.Ping(ctx).Err()
+			Expect(err).To(HaveOccurred())
+			Expect(err.(net.Error).Timeout()).To(BeTrue())
+		})
+
 		It("Ping timeouts", func() {
 			err := client.Ping(ctx).Err()
 			Expect(err).To(HaveOccurred())
