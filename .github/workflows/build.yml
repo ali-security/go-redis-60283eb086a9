@@ -1,10 +1,12 @@
 name: Go
 
 on:
-  push:
-    branches: [master, v9, v9.7]
-  pull_request:
-    branches: [master, v9, v9.7]
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional go test -run regexp; empty runs the full suite"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -13,6 +15,10 @@ jobs:
   build:
     name: build
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # monitor_test.go is gated behind this flag upstream; enable it so the MONITOR specs run too
+      RUN_MONITOR_TEST: "true"
     strategy:
       fail-fast: false
       matrix:
@@ -20,7 +26,7 @@ jobs:
 
     services:
       redis:
-        image: redis/redis-stack-server:latest
+        image: redis/redis-stack-server:7.4.0-v1
         options: >-
           --health-cmd "redis-cli ping" --health-interval 10s --health-timeout 5s --health-retries 5
         ports:
@@ -35,11 +41,110 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Test
-        run: make test
+      - name: Build module zip
+        if: matrix.go-version == '1.21.x'
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/modzip" "$RUNNER_TEMP/out"
+          cp -r "$GITHUB_WORKSPACE" "$RUNNER_TEMP/src"
+          cd "$RUNNER_TEMP/modzip"
+          cat > main.go <<'EOF'
+          package main
 
-      - name: Upload to Codecov
-        uses: codecov/codecov-action@v4
+          import (
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              f, err := os.Create(os.Args[2])
+              if err != nil {
+                  panic(err)
+              }
+              defer f.Close()
+              if err := zip.CreateFromDir(f, module.Version{Path: "github.com/redis/go-redis/v9", Version: "v9.7.0"}, os.Args[1]); err != nil {
+                  panic(err)
+              }
+          }
+          EOF
+          go mod init example.com/modzip
+          GOFLAGS=-mod=mod go get golang.org/x/mod@v0.17.0
+          GOFLAGS=-mod=mod go run . "$RUNNER_TEMP/src" "$RUNNER_TEMP/out/v9.7.0.zip"
+          unzip -l "$RUNNER_TEMP/out/v9.7.0.zip" | tail -1
+
+      - name: Upload module zip
+        if: matrix.go-version == '1.21.x'
+        uses: actions/upload-artifact@v4
         with:
-          files: coverage.txt
-          token: ${{ secrets.CODECOV_TOKEN }}
+          name: go-module-zip
+          path: ${{ runner.temp }}/out/v9.7.0.zip
+          if-no-files-found: error
+
+      - name: Report skipped and pending specs
+        if: inputs.test-filter == ''
+        run: |
+          set -euo pipefail
+          make testdeps > "$RUNNER_TEMP/testdeps.log" 2>&1 || { cat "$RUNNER_TEMP/testdeps.log"; exit 1; }
+          go test -count=1 -run TestGinkgoSuite -ginkgo.json-report="$RUNNER_TEMP/ginkgo.json" .
+          echo "=== go-redis Ginkgo suite: every skipped / pending spec and its reason ==="
+          jq -r '.[].SpecReports[] | select(.State == "skipped" or .State == "pending") | "--- \(if .State == "skipped" then "SKIP" else "PENDING" end): \(((.ContainerHierarchyTexts // []) + [.LeafNodeText]) | join(" ")) (\(.LeafNodeLocation.FileName | split("/") | last):\(.LeafNodeLocation.LineNumber)) reason: \(if (.Failure.Message // "") == "" then "marked pending (PIt/XIt) in source" else .Failure.Message end)"' "$RUNNER_TEMP/ginkgo.json"
+          jq -r '"Ginkgo spec totals: " + ([.[].SpecReports[] | select(.LeafNodeType == "It")] | group_by(.State) | map("\(.[0].State)=\(length)") | join(" ")) + " | not-run specs with reasons: " + ([.[].SpecReports[] | select(.State == "skipped" or .State == "pending") | "\(.State) \"\(((.ContainerHierarchyTexts // []) + [.LeafNodeText]) | join(" "))\" (\(.LeafNodeLocation.FileName | split("/") | last):\(.LeafNodeLocation.LineNumber)) reason: \(if (.Failure.Message // "") == "" then "marked pending (PIt/XIt) in source" else .Failure.Message end)"] | join("; "))' "$RUNNER_TEMP/ginkgo.json"
+
+      - name: Test
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            make testdeps && go test -run '${{ inputs.test-filter }}' ./...
+          else
+            make test
+          fi
+
+  build-macos:
+    name: build (macos)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      # monitor_test.go is gated behind this flag upstream; enable it so the MONITOR specs run too
+      RUN_MONITOR_TEST: "true"
+    strategy:
+      fail-fast: false
+      matrix:
+        # Go < 1.22 test binaries abort on current macOS dyld ("missing LC_UUID load command")
+        go-version: [1.23.x]
+
+    steps:
+      - name: Set up ${{ matrix.go-version }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Start redis-stack-server on 6379
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/redis-stack.zip" https://packages.redis.io/redis-stack/redis-stack-server-7.4.0-v1.monterey.arm64.zip
+          mkdir -p "$RUNNER_TEMP/redis-stack"
+          unzip -q "$RUNNER_TEMP/redis-stack.zip" -d "$RUNNER_TEMP/redis-stack"
+          "$RUNNER_TEMP/redis-stack/bin/redis-stack-server" --daemonize yes --logfile "$RUNNER_TEMP/redis-stack.log"
+          for i in $(seq 1 30); do
+            "$RUNNER_TEMP/redis-stack/bin/redis-cli" -p 6379 ping && break
+            sleep 1
+          done
+          "$RUNNER_TEMP/redis-stack/bin/redis-cli" -p 6379 MODULE LIST
+
+      - name: Test
+        run: |
+          set -e
+          make testdeps
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            go test -v -run '${{ inputs.test-filter }}' ./...
+          else
+            go test -v -ginkgo.json-report="$RUNNER_TEMP/ginkgo.json"
+            echo "=== go-redis Ginkgo suite: every skipped / pending spec and its reason ==="
+            jq -r '.[].SpecReports[] | select(.State == "skipped" or .State == "pending") | "--- \(if .State == "skipped" then "SKIP" else "PENDING" end): \(((.ContainerHierarchyTexts // []) + [.LeafNodeText]) | join(" ")) (\(.LeafNodeLocation.FileName | split("/") | last):\(.LeafNodeLocation.LineNumber)) reason: \(if (.Failure.Message // "") == "" then "marked pending (PIt/XIt) in source" else .Failure.Message end)"' "$RUNNER_TEMP/ginkgo.json"
+            jq -r '"Ginkgo spec totals: " + ([.[].SpecReports[] | select(.LeafNodeType == "It")] | group_by(.State) | map("\(.[0].State)=\(length)") | join(" ")) + " | not-run specs with reasons: " + ([.[].SpecReports[] | select(.State == "skipped" or .State == "pending") | "\(.State) \"\(((.ContainerHierarchyTexts // []) + [.LeafNodeText]) | join(" "))\" (\(.LeafNodeLocation.FileName | split("/") | last):\(.LeafNodeLocation.LineNumber)) reason: \(if (.Failure.Message // "") == "" then "marked pending (PIt/XIt) in source" else .Failure.Message end)"] | join("; "))' "$RUNNER_TEMP/ginkgo.json"
+            go test -v ./... -short -race
+          fi
